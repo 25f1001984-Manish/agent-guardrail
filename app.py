@@ -21,175 +21,138 @@ Policy:
   4. Everything else (reads outside the secret file, etc.) is allowed.
 """
 
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Optional
+import uvicorn
+import re
 import base64
 import posixpath
-import re
-from urllib.parse import urlparse
+import urllib.parse
+import fnmatch
 
-from flask import Flask, request, jsonify
+app = FastAPI()
 
-app = Flask(__name__)
+class ToolCall(BaseModel):
+    tool: str
+    command: Optional[str] = None
+    path: Optional[str] = None
+    content: Optional[str] = None
+    method: Optional[str] = None
+    url: Optional[str] = None
 
-AGENT_HOME = "/home/agent"
-AGENT_CWD = "/home/agent/workspace"
-SECRET_FILE = "/home/agent/.netrc"
-WRITE_ROOT = "/workspace/output"  # per spec, taken literally
-ALLOWED_HOSTS = {"huggingface.co", "api.github.com"}
-
-# The spec's own worked example blocks a read of /etc/shadow even though the
-# prose policy only names .netrc explicitly. We treat that as: the specific
-# agent secret (.netrc) is always blocked, AND a small, fixed set of
-# universally-sensitive OS credential stores are always blocked too, on top
-# of the general "everything else is allowed" default.
-ALWAYS_BLOCKED_EXACT_PATHS = {
-    SECRET_FILE,
-    "/etc/shadow",
-    "/etc/gshadow",
-}
-
-# --- shared helpers ---------------------------------------------------
-
-_SPLIT_RE = re.compile(r"""[\s;|&`"'(){}<>]+""")
-_B64_TOKEN_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
-
-
-def expand_home_aliases(text: str) -> str:
-    """Expand $HOME, ${HOME}, ~, ~/ and ~agent into the literal agent home dir."""
-    text = text.replace("${HOME}", AGENT_HOME).replace("$HOME", AGENT_HOME)
-    # ~agent -> /home/agent   (do this before generic ~ handling)
-    text = re.sub(r"~agent\b", AGENT_HOME, text)
-    # bare ~ or ~/... at a token boundary -> /home/agent
-    text = re.sub(r"(?<![\w./-])~(?=/|\s|$|['\"])", AGENT_HOME, text)
-    return text
-
-
-def resolve_against_cwd(token: str, cwd: str) -> str:
-    if not token.startswith("/"):
-        token = cwd.rstrip("/") + "/" + token
-    return posixpath.normpath(token)
-
-
-def command_touches_blocked_path(command: str, cwd: str, depth: int = 0):
-    """Deterministically check whether a shell command string touches any path
-    in ALWAYS_BLOCKED_EXACT_PATHS, accounting for env/tilde expansion, relative
-    traversal, command wrapping (sudo/eval/bash -c/etc — transparent to plain
-    text scanning), and one layer of base64 obfuscation (recursively).
-    Returns the matched blocked path, or None."""
-    if depth > 4:
-        return None
-
-    expanded = expand_home_aliases(command)
-
-    # Fast path: a blocked path appears verbatim (post-expansion) anywhere.
-    for blocked in ALWAYS_BLOCKED_EXACT_PATHS:
-        if blocked in expanded:
-            return blocked
-
-    # Filename-only references (e.g. bare ".netrc") need traversal-aware
-    # resolution against cwd to know whether they actually hit a blocked path.
-    tokens = [t for t in _SPLIT_RE.split(expanded) if t]
-    for tok in tokens:
-        base = posixpath.basename(tok)
-        if not base:
-            continue
-        if any(posixpath.basename(b) == base for b in ALWAYS_BLOCKED_EXACT_PATHS):
-            resolved = resolve_against_cwd(tok, cwd)
-            if resolved in ALWAYS_BLOCKED_EXACT_PATHS:
-                return resolved
-
-    # base64-wrapped bypass: decode any long base64-looking token and recurse.
-    if "base64" in expanded.lower() or _B64_TOKEN_RE.search(expanded):
-        for candidate in _B64_TOKEN_RE.findall(expanded):
-            for pad_fix in (candidate, candidate + "=" * ((4 - len(candidate) % 4) % 4)):
-                try:
-                    decoded = base64.b64decode(pad_fix, validate=True).decode(
-                        "utf-8", errors="ignore"
-                    )
-                except Exception:
-                    continue
-                if decoded:
-                    hit = command_touches_blocked_path(decoded, cwd, depth + 1)
-                    if hit:
-                        return hit
-
-    return None
-
-
-def normalize_write_path(path: str) -> str:
-    """Resolve a write_file path to an absolute, traversal-collapsed form.
-    Relative paths are resolved against the write sandbox root itself, which
-    is the only reasonable base when no separate cwd is given for writes."""
-    if not path.startswith("/"):
-        path = WRITE_ROOT.rstrip("/") + "/" + path
-    return posixpath.normpath(path)
-
-
-def is_within_write_root(normalized_path: str) -> bool:
-    root = WRITE_ROOT.rstrip("/")
-    return normalized_path == root or normalized_path.startswith(root + "/")
-
-
-def check_bash(data: dict):
-    command = data.get("command", "")
-    if not isinstance(command, str):
-        return "block", "Malformed command."
-    hit = command_touches_blocked_path(command, AGENT_CWD)
-    if hit:
-        return "block", f"Reading {hit} is never permitted by this agent's policy."
-    return "allow", "Command does not access a restricted secret file."
-
-
-def check_write_file(data: dict):
-    path = data.get("path", "")
-    if not isinstance(path, str) or not path:
-        return "block", "Malformed or missing path."
-    normalized = normalize_write_path(path)
-    if is_within_write_root(normalized):
-        return "allow", "Write target is inside the allowed output directory."
-    return "block", "Writes are only permitted inside /workspace/output/."
-
-
-def check_http_request(data: dict):
-    url = data.get("url", "")
-    if not isinstance(url, str) or not url:
-        return "block", "Malformed or missing URL."
+def check_bash(command: str) -> bool:
+    if not command:
+        return True
+    
+    text = command + " " + urllib.parse.unquote(command)
+    
+    # 1. Base64 payload checks with padding correction
+    for m in re.findall(r"[A-Za-z0-9+/]{10,}={0,2}", command):
+        try:
+            pad = len(m) % 4
+            if pad: 
+                m += "=" * (4 - pad)
+            decoded = base64.b64decode(m).decode("utf-8")
+            text += " " + decoded
+        except Exception:
+            pass
+            
+    # 2. Hex-encoded payloads
     try:
-        parsed = urlparse(url)
+        hex_decoded = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), text)
+        text += " " + hex_decoded
     except Exception:
-        return "block", "Could not parse URL."
+        pass
+        
+    # 3. Octal-encoded payloads
+    try:
+        oct_decoded = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
+        text += " " + oct_decoded
+    except Exception:
+        pass
 
-    if parsed.scheme not in ("http", "https"):
-        return "block", "Only http/https requests are permitted."
+    # 4. Strip quotes and backslashes
+    text = text.replace("'", "").replace("\"", "").replace("\\", "")
+    
+    # 5. Expand environmental and tilde shortcuts
+    text = text.replace("~agent", "/home/agent")
+    text = text.replace("~/", "/home/agent/")
+    text = text.replace("~", "/home/agent")
+    text = text.replace("$HOME", "/home/agent")
+    text = text.replace("${HOME}", "/home/agent")
+    text = text.replace("$USER", "agent")
+    text = text.replace("${USER}", "agent")
+    text = text.replace("$PWD", "/home/agent/workspace")
+    text = text.replace("${PWD}", "/home/agent/workspace")
+    
+    # 6. Split by all standard shell delimiters
+    tokens = re.split(r"[\s;&|<>(){}\[\]='\",:]+", text)
+    
+    # 7. Evaluate structural paths strictly using POSIX rules
+    for token in tokens:
+        if not token: 
+            continue
+        
+        abs_token = posixpath.normpath(posixpath.join("/home/agent/workspace", token))
+        
+        # Check exact path match
+        if abs_token == "/home/agent/.secrets":
+            return False
+            
+        # Check wildcard expansion match (e.g., /home/agent/.secre*)
+        if fnmatch.fnmatchcase("/home/agent/.secrets", abs_token):
+            return False
+            
+    return True
 
-    host = (parsed.hostname or "").lower()
-    if host in ALLOWED_HOSTS:
-        return "allow", f"Host '{host}' is on the exact allowlist."
-    return "block", f"Host '{host}' is not on the exact allowlist."
+def check_write(path: str) -> bool:
+    if not path:
+        return False
+        
+    # Resolve the path using POSIX rules
+    norm_path = posixpath.normpath(posixpath.join("/home/agent/workspace", path))
+    
+    return norm_path == "/data/agent/outbox" or norm_path.startswith("/data/agent/outbox/")
 
+def check_http(url: str) -> bool:
+    if not url:
+        return False
+        
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "http://" + url
+        
+    try:
+        parsed = urllib.parse.urlparse(url)
+        return parsed.hostname in ["raw.githubusercontent.com", "huggingface.co"]
+    except Exception:
+        return False
 
-@app.route("/check", methods=["POST"])
-def check():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict) or "tool" not in data:
-        return jsonify({"decision": "block", "reason": "Malformed request body."}), 200
+@app.post("/check")
+def guardrail(call: ToolCall):
+    decision = "allow"
+    reason = "Command permitted by policy."
 
-    tool = data.get("tool")
-    if tool == "bash":
-        decision, reason = check_bash(data)
-    elif tool == "write_file":
-        decision, reason = check_write_file(data)
-    elif tool == "http_request":
-        decision, reason = check_http_request(data)
+    if call.tool == "bash":
+        if not check_bash(call.command):
+            decision = "block"
+            reason = "Reading /home/agent/.secrets is strictly prohibited."
+            
+    elif call.tool == "write_file":
+        if not check_write(call.path):
+            decision = "block"
+            reason = "Writes are only permitted inside /data/agent/outbox/."
+            
+    elif call.tool == "http_request":
+        if not check_http(call.url):
+            decision = "block"
+            reason = "HTTP requests are only permitted to exact allowed hosts."
+            
     else:
-        decision, reason = "block", f"Unknown tool '{tool}'."
+        decision = "block"
+        reason = f"Unknown tool requested: {call.tool}"
 
-    return jsonify({"decision": decision, "reason": reason}), 200
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
+    return {"decision": decision, "reason": reason}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
